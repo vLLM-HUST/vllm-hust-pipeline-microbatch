@@ -1,0 +1,947 @@
+From f80aefce9d6a5bdb06e067088cf9242d9faec807 Mon Sep 17 00:00:00 2001
+From: Chenxi XU <xcx14@outlook.com>
+Date: Sat, 18 Jul 2026 04:10:10 +0800
+Subject: [PATCH] Support pipeline-parallel microbatch scheduling
+
+---
+ .../developer_guide/Design_Documents/index.md |   1 +
+ .../Design_Documents/pp_optimization.md       |  73 +++++
+ vllm_ascend/ops/fused_moe/fused_moe.py        | 306 +++---------------
+ vllm_ascend/ops/rotary_embedding.py           |   5 +-
+ vllm_ascend/patch/worker/patch_distributed.py |   5 +
+ vllm_ascend/utils.py                          |  30 +-
+ vllm_ascend/worker/block_table.py             |  75 +++++
+ vllm_ascend/worker/model_runner_v1.py         |  59 +++-
+ vllm_ascend/worker/worker.py                  |  45 ++-
+ 9 files changed, 290 insertions(+), 309 deletions(-)
+ create mode 100644 docs/source/developer_guide/Design_Documents/pp_optimization.md
+
+diff --git a/docs/source/developer_guide/Design_Documents/index.md b/docs/source/developer_guide/Design_Documents/index.md
+index c35ed452d4..f72fb07906 100644
+--- a/docs/source/developer_guide/Design_Documents/index.md
++++ b/docs/source/developer_guide/Design_Documents/index.md
+@@ -15,6 +15,7 @@ KV_Cache_Pool_Guide
+ add_custom_aclnn_op
+ context_parallel
+ dynamic_chunked_pipeline_parallel
++pp_optimization
+ quantization
+ npugraph_ex
+ :::
+diff --git a/docs/source/developer_guide/Design_Documents/pp_optimization.md b/docs/source/developer_guide/Design_Documents/pp_optimization.md
+new file mode 100644
+index 0000000000..1d4fcdeedb
+--- /dev/null
++++ b/docs/source/developer_guide/Design_Documents/pp_optimization.md
+@@ -0,0 +1,73 @@
++# Pipeline-Parallel Optimization Integration
++
++This repository supplies the Ascend runtime integration for the PP
++optimization scheduler in the paired vLLM-HUST repository. Install both
++repositories from sibling editable source trees; mixing this plugin with a
++binary vLLM package is unsupported.
++
++## Runtime contract
++
++The scheduler keeps multiple decode microbatches in flight. Each
++`SchedulerOutput` carries a microbatch ID, and a microbatch remains unavailable
++until EngineCore retires its model output. The Ascend worker must therefore
++preserve PP send-buffer lifetime across queued executions and expose rank-local
++timing for calibration.
++
++When `VLLM_PP_OPT_OVERLAP_SENDS=0`, the communication coordinator waits for the
++previous tensor send immediately before issuing the next send. When overlap is
++enabled, the worker clones intermediate tensors and retains references until
++all asynchronous send handles complete. The benchmark's validated
++configuration uses overlap disabled.
++
++## Model runner changes
++
++The NPU model runner records request count, aggregate context length, scheduled
++tokens, and forward boundaries when `VLLM_PROFILE_PP_OPT_ENABLED=1`. Profiling
++is disabled by default. Calibration mode synchronizes the NPU only around the
++measured forward interval; normal serving does not add this synchronization.
++
++`VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` adds a CANN scope with PP rank,
++microbatch ID, request count, context tokens, and scheduled tokens. This scope
++supports device-side pipeline occupancy analysis through the built-in
++`torch_npu` profiler.
++
++The DecodeBench path uses CPU slot mapping when
++`VLLM_ASCEND_FORCE_CPU_SLOT_MAPPING=1`. This avoids unsupported slot-mapping
++kernel behavior for externally supplied KV blocks. KV filling accepts Ascend's
++separate key/value cache tensors and batches fills by cache group.
++
++## Model compatibility
++
++The tested Qwen models use native rotary embedding when
++`VLLM_ASCEND_FORCE_NATIVE_ROPE=1`. Qwen3-235B-A22B also requires the current
++vLLM MoE runner API: shared experts are attached to the unified `FusedMoE`
++runner, and the final tensor-parallel reduction happens after routed and shared
++outputs are combined.
++
++These compatibility changes affect baseline and optimized runs equally. The
++optimization does not bypass transformer layers or replace model forward
++execution.
++
++## Editable setup
++
++From the parent workspace:
++
++```bash
++python3.11 -m venv --system-site-packages .venv-pp-opt
++source .venv-pp-opt/bin/activate
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++source /path/to/atb/set_env.sh --cxx_abi=1
++
++VLLM_TARGET_DEVICE=empty \
++  pip install --no-build-isolation -e ./vllm-hust
++pip install --no-build-isolation -e ./vllm-ascend-hust
++```
++
++Verify the source paths before benchmarking:
++
++```bash
++python -c 'import vllm, vllm_ascend; print(vllm.__file__); print(vllm_ascend.__file__)'
++```
++
++The benchmark launcher in `vllm-hust/benchmarks/pp_opt` performs a stricter
++editable-install check automatically.
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+index f9f993fd07..a7b9509c50 100644
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -15,13 +15,10 @@
+ # limitations under the License.
+ #
+ from collections.abc import Callable
+-from dataclasses import dataclass, field
+-from functools import wraps
++from dataclasses import dataclass
+ 
+ import torch
+-import torch.nn.functional as F
+ import torch_npu
+-from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.config import get_current_vllm_config
+ from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, tensor_model_parallel_all_reduce
+ from vllm.forward_context import get_forward_context
+@@ -29,8 +26,8 @@ from vllm.logger import logger
+ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+ from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod, get_compressed_expert_map
+ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
+-from vllm.model_executor.layers.fused_moe.runner.default_moe_runner import DefaultMoERunner  # type: ignore
+-from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
++from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
++from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExpertsOrder
+ 
+ import vllm_ascend.envs as envs_ascend
+ from vllm_ascend.ascend_config import get_ascend_config
+@@ -45,11 +42,9 @@ from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
+ from vllm_ascend.quantization.quant_type import QuantType
+ from vllm_ascend.utils import (
+     ACL_FORMAT_FRACTAL_NZ,
+-    enable_sp,
+     maybe_trans_nz,
+     npu_stream_switch,
+     shared_expert_dp_enabled,
+-    shared_experts_calculation_stream,
+ )
+ 
+ 
+@@ -60,21 +55,6 @@ class FusedMoEResult:
+     before_combine_evt: torch.npu.Event | None = None
+ 
+ 
+-@dataclass
+-class FusedMoEEvents:
+-    before_routed_experts: torch.npu.Event
+-    before_dispatch: torch.npu.Event | None = field(default=None)
+-    before_combine: torch.npu.Event | None = field(default=None)
+-
+-
+-def mock_false():
+-    return False
+-
+-
+-def mock_true():
+-    return True
+-
+-
+ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+     def __init__(self, moe: FusedMoEConfig = None):
+         super().__init__(moe=moe)
+@@ -229,47 +209,29 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         return final_hidden_states
+ 
+ 
+-# Please remove this inheritance after extending vllm, todo(wxs)
+-class AscendMoERunner(DefaultMoERunner):
+-    @property
+-    def use_dp_chunking(self) -> bool:
+-        """Ascend uses its own forward_impl path, not the FlashInfer Cutlass
+-        chunked path. Always return False to stay on forward_impl."""
+-        return False
+-
+-    # TODO: Remove this after drop v0.19.1 support
+-    def forward_impl(
+-        self,
+-        layer: torch.nn.Module,
+-        hidden_states: torch.Tensor,
+-        router_logits: torch.Tensor,
+-        shared_input: torch.Tensor | None,
+-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+-        """
+-        Override the default forward_impl to use Ascend-specific implementation.
+-        This delegates to the layer's forward_impl method which contains the
+-        Ascend-specific MoE computation logic.
+-        """
+-        result = layer.forward_impl(hidden_states, router_logits)
+-        # If the layer has shared experts, forward_impl returns a tuple (shared_out, routed_out)
+-        # Otherwise, it returns just routed_out
+-        # The torch op expects the same return type based on whether it's moe_forward or moe_forward_shared
+-        return result
+-
+-    def forward_dispatch(
++class AscendMoERunner(MoERunner):
++    def _forward_impl(
+         self,
+         layer: torch.nn.Module,
+         hidden_states: torch.Tensor,
+         router_logits: torch.Tensor,
+         shared_experts_input: torch.Tensor | None,
++        input_ids: torch.Tensor | None = None,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        layer.ensure_moe_quant_config_init()
++        if self.gate is not None:
++            router_logits, _ = self.gate(hidden_states)
++
+         with self._sequence_parallel_context():
+-            return self.forward_impl(
+-                layer,
+-                hidden_states,
+-                router_logits,
++            self._maybe_apply_shared_experts(
+                 shared_experts_input,
++                SharedExpertsOrder.NO_OVERLAP,
+             )
++            routed_out = layer.forward_impl(hidden_states, router_logits)
++
++        if self.shared_experts is None:
++            return routed_out
++        return self.shared_experts.output, routed_out
+ 
+ 
+ class AscendFusedMoE(FusedMoE):
+@@ -277,6 +239,10 @@ class AscendFusedMoE(FusedMoE):
+     gate_stream: torch.npu.Stream | None = None
+ 
+     def __init__(self, *args, **kwargs):
++        routed_input_transform = kwargs.get("routed_input_transform")
++        routed_output_transform = kwargs.get("routed_output_transform")
++        gate = kwargs.get("gate")
++        shared_experts = kwargs.get("shared_experts")
+         super().__init__(*args, **kwargs)
+ 
+         num_experts = kwargs["num_experts"]
+@@ -295,6 +261,7 @@ class AscendFusedMoE(FusedMoE):
+             self.quant_method = self.quant_config.get_quant_method(self, self.layer_name)
+ 
+         assert self.quant_method is not None
++        self.base_quant_method = self.quant_method
+ 
+         self.moe_config.tp_group = get_tp_group()
+         self.moe_config.dp_group = get_dp_group()
+@@ -367,15 +334,15 @@ class AscendFusedMoE(FusedMoE):
+         self.quant_type = self._get_quant_type()
+ 
+         self.runner = AscendMoERunner(
+-            self.layer_name,
+-            self.moe_config,
+-            self.router,
+-            self._routed_input_transform,
+-            kwargs.pop("gate", None),
+-            kwargs.pop("shared_experts", None),
+-            self.quant_method,
+-            self.reduce_results,
+-            self.vllm_config.parallel_config.enable_dbo,
++            layer_name=self.layer_name,
++            moe_config=self.moe_config,
++            router=self.router,
++            routed_input_transform=routed_input_transform,
++            gate=gate,
++            shared_experts=shared_experts,
++            quant_method=self.quant_method,
++            enable_dbo=self.vllm_config.parallel_config.enable_dbo,
++            routed_output_transform=routed_output_transform,
+         )
+ 
+     def _get_quant_type(self) -> QuantType:
+@@ -412,11 +379,13 @@ class AscendFusedMoE(FusedMoE):
+         self,
+         hidden_states: torch.Tensor,
+         router_logits: torch.Tensor,
+-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        input_ids: torch.Tensor | None = None,
++    ) -> torch.Tensor:
+         self.ensure_moe_quant_config_init()
+         return self.runner.forward(
+             hidden_states,
+             router_logits,
++            input_ids,
+         )
+ 
+     def forward_impl(  # type: ignore[override]
+@@ -539,7 +508,9 @@ class AscendFusedMoE(FusedMoE):
+                 self.moe_load.add_(local_load)
+         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
+             hidden_states=fused_experts_results.routed_out,
+-            reduce_results=self.reduce_results,
++            # Current MoERunner performs the final TP reduction after combining
++            # routed and shared outputs.
++            reduce_results=False,
+             padded_hidden_states_shape=padded_hidden_states_shape,
+         )
+ 
+@@ -554,204 +525,5 @@ class AscendFusedMoE(FusedMoE):
+             return routed_out
+ 
+ 
+-class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
+-    def __init__(
+-        self,
+-        shared_experts: torch.nn.Module,
+-        gate: torch.nn.Module | None = None,
+-        use_overlapped: bool = True,
+-        routed_input_transform: torch.nn.Module | None = None,
+-        **kwargs,
+-    ):
+-        ascend_config = get_ascend_config()
+-        # TODO: Enabling the mix placement in deepseek_v2.py
+-        # remove this part after the mix placement merged into vllm
+-        # https://github.com/vllm-project/vllm/pull/31256
+-        if ascend_config.mix_placement:
+-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = mock_false
+-            rocm_aiter_ops.is_fused_moe_enabled = mock_false
+-        AscendFusedMoE.__init__(self, **kwargs)
+-        if ascend_config.mix_placement:
+-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = mock_true
+-            rocm_aiter_ops.is_fused_moe_enabled = mock_true
+-
+-        self._routed_input_transform = routed_input_transform
+-        self._shared_experts = shared_experts
+-        self.use_overlapped = use_overlapped
+-        self.shared_expert_stream = None
+-        has_shared_experts = shared_experts is not None
+-        self.multistream_overlap_shared_expert = ascend_config.multistream_overlap_shared_expert and has_shared_experts
+-        self.multistream_overlap_gate = ascend_config.multistream_overlap_gate and has_shared_experts
+-        if enable_sp():
+-            logger.info_once("Sequence parallelism is enabled, shared experts are replicated for best performance.")
+-
+-        self._gate = gate
+-        # Recreate the runner with the correct shared_experts parameter.
+-        # The parent class created the runner before self._shared_experts was set.
+-        # NOTE: must use self._shared_experts here, not self.shared_experts —
+-        # FusedMoE.shared_experts is a property that reads self.runner.shared_experts,
+-        # which at this point is still the stale runner built with shared_experts=None.
+-        self.runner = AscendMoERunner(
+-            self.layer_name,
+-            self.moe_config,
+-            self.router,
+-            self._routed_input_transform,
+-            self.gate,
+-            self._shared_experts,
+-            self.quant_method,
+-            self.reduce_results,
+-            self.vllm_config.parallel_config.enable_dbo,
+-        )
+-
+-        if self.multistream_overlap_shared_expert:
+-            # Wrap the quant_method's process_weights_after_loading to validate that
+-            # splitting shared expert computation (gate_up projection + activation,
+-            # then down projection) yields identical results to integrated
+-            # computation after weight loading.
+-            original_process_weights = self.quant_method.process_weights_after_loading
+-
+-            @wraps(original_process_weights)
+-            def wrapped_process_weights(*args, **kwargs):
+-                result = original_process_weights(*args, **kwargs)
+-                self._validate_shared_expert_consistency()
+-                return result
+-
+-            self.quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore
+-
+-    def _shared_experts_part1(self, hidden_states: torch.Tensor):
+-        shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
+-        return shared_gate_up
+-
+-    def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
+-        shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore
+-        shared_out, _ = self._shared_experts.down_proj(shared_act)  # type: ignore
+-
+-        # Qwen3-Next specific gating mechanism
+-        if hasattr(self._shared_experts, "expert_gate") and self._shared_experts.expert_gate is not None:
+-            gate_out, _ = self._shared_experts.expert_gate(hidden_states)  # type: ignore
+-            shared_out = F.sigmoid(gate_out) * shared_out
+-        return shared_out
+-
+-    def _validate_shared_expert_consistency(self):
+-        """Validate that split shared expert computation matches integrated
+-        computation."""
+-        test_input = (
+-            torch.rand(10, self.hidden_size, device="npu", dtype=self.moe_config.in_dtype) * 2 - 1
+-        )  # Random input for testing, scoped to [-1, 1]
+-
+-        integrated_out = self._shared_experts(test_input)
+-        part1_out = self._shared_experts_part1(test_input)
+-        split_out = self._shared_experts_part2(test_input, part1_out)
+-
+-        if not torch.allclose(integrated_out, split_out):
+-            diff = (integrated_out - split_out).abs()
+-            logger.error("SharedFusedMoE shared experts split computation does not match the integrated computation.")
+-            logger.error("Max absolute difference: %s", diff.max().item())
+-            logger.error(
+-                "Integrated output - sum: %s, norm: %s", integrated_out.sum().item(), integrated_out.norm().item()
+-            )
+-            logger.error("Split output - sum: %s, norm: %s", split_out.sum().item(), split_out.norm().item())
+-            raise ValueError(
+-                "SharedFusedMoE shared experts split computation does not match the integrated computation."
+-            )
+-        logger.info_once("SharedFusedMoE shared experts split computation matches the integrated computation.")
+-
+-    @property
+-    def gate(self) -> torch.nn.Module | None:
+-        return self._gate if self.use_overlapped else None
+-
+-    @property
+-    def is_internal_router(self) -> bool:
+-        return False
+-
+-    @property
+-    def use_dp_chunking(self) -> bool:
+-        """This func routes to the chunked forward path using the FlashInfer Cutlass kernel
+-        only when data parallelism (DP) is enabled. Thus just returning False in vllm-ascend
+-        """
+-        return False
+-
+-    def forward(
+-        self,
+-        hidden_states: torch.Tensor,
+-        router_logits: torch.Tensor,
+-    ) -> tuple[torch.Tensor, torch.Tensor]:
+-        result = AscendFusedMoE.forward(
+-            self,
+-            hidden_states=hidden_states,
+-            router_logits=router_logits,
+-        )
+-        # When shared experts are absent, the parent returns only fused_out;
+-        # otherwise it returns a (shared_out, fused_out) tuple.
+-        if self._shared_experts is None:
+-            return None, result
+-        return result
+-
+-    def _forward_shared_experts(self, hidden_states: torch.Tensor, fused_moe_evts: FusedMoEEvents):
+-        if self._shared_experts is None:
+-            return None
+-
+-        def maybe_wait_event(evt: torch.npu.Event | None):
+-            if evt is not None:
+-                torch.npu.current_stream().wait_event(evt)
+-
+-        with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap_shared_expert):
+-            # Ensure the shared experts wait for hidden_states to be ready.
+-            torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
+-            # Execute the gate projection and activation concurrently with the
+-            # dispatch communication.
+-            maybe_wait_event(fused_moe_evts.before_dispatch)
+-            part1_out = self._shared_experts_part1(hidden_states)
+-            # Execute the down projection concurrently with the combine
+-            # communication.
+-            maybe_wait_event(fused_moe_evts.before_combine)
+-            shared_out = self._shared_experts_part2(hidden_states, part1_out)
+-
+-        # Make sure the default stream waits for the shared experts stream to
+-        # finish.
+-        if self.multistream_overlap_shared_expert:
+-            torch.npu.current_stream().wait_stream(shared_experts_calculation_stream())
+-
+-        # NOTE: This is exactly the opposite of
+-        # `maybe_all_reduce_tensor_model_parallel`
+-        moe_comm_type = _EXTRA_CTX.moe_comm_type
+-        if (
+-            moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
+-            and not shared_expert_dp_enabled()
+-        ):
+-            shared_out = tensor_model_parallel_all_reduce(shared_out)
+-        return shared_out
+-
+-    def forward_impl(  # type: ignore[override]
+-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+-    ):
+-        if self.multistream_overlap_gate:
+-            set_flash_common3_context(shared_experts=self._shared_experts)
+-
+-        before_routed_experts = torch.npu.current_stream().record_event()
+-        fused_moe_results = AscendFusedMoE.forward_impl(
+-            self,
+-            hidden_states=hidden_states,
+-            router_logits=router_logits,
+-            return_with_event=True,
+-        )
+-        routed_out = fused_moe_results.routed_out
+-
+-        if self._shared_experts is None:
+-            return routed_out
+-
+-        if self.multistream_overlap_gate:
+-            fc3_context = get_flash_common3_context()
+-            assert fc3_context is not None
+-            shared_out = fc3_context.shared_out
+-        else:
+-            shared_out = self._forward_shared_experts(
+-                hidden_states,
+-                FusedMoEEvents(
+-                    before_routed_experts=before_routed_experts,
+-                    before_dispatch=fused_moe_results.before_dispatch_evt,
+-                    before_combine=fused_moe_results.before_combine_evt,
+-                ),
+-            )
+-
+-        return shared_out, routed_out
++# Shared experts are integrated into FusedMoE in the current vLLM runner API.
++AscendSharedFusedMoE = AscendFusedMoE
+diff --git a/vllm_ascend/ops/rotary_embedding.py b/vllm_ascend/ops/rotary_embedding.py
+index 1aa97ca252..4038b9fdac 100644
+--- a/vllm_ascend/ops/rotary_embedding.py
++++ b/vllm_ascend/ops/rotary_embedding.py
+@@ -163,7 +163,8 @@ def rope_forward_oot(
+     query_shape, key_shape = query.shape, key.shape
+     if offsets is not None:
+         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
+-    if HAS_TRITON:
++    use_triton_rope = HAS_TRITON and os.environ.get("VLLM_ASCEND_FORCE_NATIVE_ROPE", "0") == "0"
++    if use_triton_rope:
+         num_tokens = query.shape[0]
+         query, key = rope_forward_triton(
+             query.view(num_tokens, -1, head_size),
+@@ -245,7 +246,7 @@ class AscendRotaryEmbedding(RotaryEmbedding):
+         is_neox_style = self.is_neox_style
+         if is_neox_style_override is not None:
+             is_neox_style = is_neox_style_override
+-        if self.force_native_qwen2_rope:
++        if self.force_native_qwen2_rope or self.rotary_dim < self.head_size:
+             cos_sin_cache = self._match_cos_sin_cache_dtype(query)
+             return RotaryEmbedding.forward_static(
+                 positions,
+diff --git a/vllm_ascend/patch/worker/patch_distributed.py b/vllm_ascend/patch/worker/patch_distributed.py
+index 13fdbc0fc8..a6234247ec 100644
+--- a/vllm_ascend/patch/worker/patch_distributed.py
++++ b/vllm_ascend/patch/worker/patch_distributed.py
+@@ -21,6 +21,7 @@ from typing import Any, cast
+ 
+ import torch
+ import vllm
++import vllm.envs as envs
+ from torch.distributed import Backend
+ from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
+ 
+@@ -124,6 +125,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
+         self.device = None
+         self.use_custom_op_call = True
+         self.use_cpu_custom_send_recv = False
++        if envs.VLLM_USE_PP_OPT_SCHEDULER:
++            self.size_send_work: torch.distributed.Work | None = None
++            self.object_send_work: torch.distributed.Work | None = None
++            self.tensor_send_works: list[torch.distributed.Work] = []
+ 
+         reuse_domain = _resolve_reuse_domain(group_name)
+ 
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index 2739bdda57..2c80fccec9 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -676,16 +676,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
+         AscendVocabParallelEmbedding,
+     )
+ 
+-    try:
+-        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE, AscendSharedFusedMoE
+-    except ModuleNotFoundError as exc:
+-        logger.warning(
+-            "Skipping Ascend fused MoE custom op registration because an optional "
+-            "upstream dependency is unavailable: %s",
+-            exc,
+-        )
+-        AscendFusedMoE = None
+-        AscendSharedFusedMoE = None
+     is_moe_model = bool(
+         vllm_config is not None
+         and vllm_config.model_config is not None
+@@ -721,14 +711,9 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
+     }
+ 
+     if is_moe_model:
+-        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE, AscendSharedFusedMoE
++        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
+ 
+-        REGISTERED_ASCEND_OPS.update(
+-            {
+-                "FusedMoE": AscendFusedMoE,
+-                "SharedFusedMoE": AscendSharedFusedMoE,
+-            }
+-        )
++        REGISTERED_ASCEND_OPS["FusedMoE"] = AscendFusedMoE
+ 
+     # 310P: override selected ops with 310P implementations (keep minimal changes outside _310p)
+     if is_310p():
+@@ -754,8 +739,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
+                 "RMSNorm": AscendRMSNorm310,
+                 "GemmaRMSNorm": AscendGemmaRMSNorm310,
+                 "RMSNormGated": AscendRMSNormGated310,
+-                "FusedMoE": AscendFusedMoE310,
+-                "SharedFusedMoE": AscendSharedFusedMoE310,
+                 "ParallelLMHead": AscendParallelLMHead310,
+                 "VocabParallelEmbedding": AscendVocabParallelEmbedding310,
+                 "MMEncoderAttention": AscendMMEncoderAttention310,
+@@ -764,14 +747,9 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
+             }
+         )
+         if is_moe_model:
+-            from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310, AscendSharedFusedMoE310
++            from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310
+ 
+-            REGISTERED_ASCEND_OPS.update(
+-                {
+-                    "FusedMoE": AscendFusedMoE310,
+-                    "SharedFusedMoE": AscendSharedFusedMoE310,
+-                }
+-            )
++            REGISTERED_ASCEND_OPS["FusedMoE"] = AscendFusedMoE310
+ 
+         REGISTERED_ASCEND_OPS.pop("MRotaryEmbedding", None)
+ 
+diff --git a/vllm_ascend/worker/block_table.py b/vllm_ascend/worker/block_table.py
+index 26ddfe5560..e190fa6132 100644
+--- a/vllm_ascend/worker/block_table.py
++++ b/vllm_ascend/worker/block_table.py
+@@ -213,6 +213,75 @@ class BlockTable:
+         row_stride = self.max_num_blocks_per_req * self.blocks_per_phys_block
+         return req_indices * row_stride + logical_block_idx
+ 
++    def compute_slot_mapping_cpu(
++        self,
++        req_indices: np.ndarray,
++        positions: np.ndarray,
++    ) -> None:
++        req_indices = req_indices.astype(np.int64, copy=False)
++        positions = positions.astype(np.int64, copy=False)
++        num_tokens = positions.shape[0]
++        max_num_tokens = min(self.max_num_batched_tokens, self.slot_mapping.np.shape[0])
++
++        if num_tokens == 0:
++            self.slot_mapping.np[:max_num_tokens] = PAD_SLOT_ID
++            self.slot_mapping.copy_to_gpu(max_num_tokens)
++            return
++
++        if req_indices.shape[0] != num_tokens:
++            raise ValueError(
++                f"req_indices and positions describe different token counts: {req_indices.shape[0]} != {num_tokens}"
++            )
++
++        if self.dcp_world_size * self.pcp_world_size > 1:
++            virtual_block_size = (
++                self.block_size * self.dcp_world_size * self.pcp_world_size
++            )
++            logical_block_idx = positions // virtual_block_size
++            block_table_indices = self._get_block_table_indices(
++                req_indices, logical_block_idx
++            )
++            block_numbers = self.block_table.np.ravel()[block_table_indices]
++            virtual_block_offsets = positions % virtual_block_size
++            current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank
++            mask = (
++                virtual_block_offsets
++                // self.cp_kv_cache_interleave_size
++                % (self.dcp_world_size * self.pcp_world_size)
++                == current_rank
++            )
++            block_offsets = (
++                virtual_block_offsets
++                // (
++                    self.dcp_world_size
++                    * self.pcp_world_size
++                    * self.cp_kv_cache_interleave_size
++                )
++                * self.cp_kv_cache_interleave_size
++                + virtual_block_offsets % self.cp_kv_cache_interleave_size
++            )
++            slot_mapping = block_numbers * self.block_size + block_offsets
++            self.slot_mapping.np[:num_tokens] = np.where(
++                mask, slot_mapping, PAD_SLOT_ID
++            )
++        else:
++            logical_block_idx = positions // self.block_size
++            block_table_indices = self._get_block_table_indices(
++                req_indices, logical_block_idx
++            )
++            block_numbers = self.block_table.np.ravel()[block_table_indices]
++            block_offsets = positions % self.block_size
++            np.add(
++                block_numbers * self.block_size,
++                block_offsets,
++                out=self.slot_mapping.np[:num_tokens],
++            )
++
++        if num_tokens < max_num_tokens:
++            self.slot_mapping.np[num_tokens:max_num_tokens] = PAD_SLOT_ID
++
++        self.slot_mapping.copy_to_gpu(max_num_tokens)
++
+     @staticmethod
+     def _to_numpy(value) -> np.ndarray:
+         if isinstance(value, np.ndarray):
+@@ -417,6 +486,12 @@ class MultiGroupBlockTable:
+         for block_table in self.block_tables:
+             block_table.compute_slot_mapping_draft(req_indices, positions)
+ 
++    def compute_slot_mapping_cpu(
++        self, req_indices: np.ndarray, positions: np.ndarray
++    ) -> None:
++        for block_table in self.block_tables:
++            block_table.compute_slot_mapping_cpu(req_indices, positions)
++
+     def commit_block_table(self, num_reqs: int) -> None:
+         for block_table in self.block_tables:
+             block_table.commit_block_table(num_reqs)
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index cfe447fc6d..32f7c97f99 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -18,6 +18,7 @@
+ #
+ 
+ import math
++import os
+ import sys
+ import time
+ from collections import defaultdict
+@@ -81,7 +82,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ from vllm.v1.structured_output.utils import apply_grammar_bitmask
+ from vllm.v1.utils import record_function_or_nullcontext
+-from vllm.v1.worker import mamba_utils
++from vllm.v1.worker import mamba_utils, pp_opt_profile
+ from vllm.v1.worker.cp_utils import (
+     get_total_cp_world_size,
+ )
+@@ -1022,11 +1023,17 @@ class NPUModelRunner(GPUModelRunner):
+         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
+         # already computed on GPU before PCP split the positions.
+         if self.pcp_size <= 1:
+-            self.input_batch.block_table.compute_slot_mapping(
+-                num_reqs,
+-                self.query_start_loc.gpu[: num_reqs + 1],
+-                self.positions[:total_num_scheduled_tokens],
+-            )
++            if os.environ.get("VLLM_ASCEND_FORCE_CPU_SLOT_MAPPING", "0") == "1":
++                self.input_batch.block_table.compute_slot_mapping_cpu(
++                    req_indices,
++                    positions_np[:total_num_scheduled_tokens],
++                )
++            else:
++                self.input_batch.block_table.compute_slot_mapping(
++                    num_reqs,
++                    self.query_start_loc.gpu[: num_reqs + 1],
++                    self.positions[:total_num_scheduled_tokens],
++                )
+ 
+         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
+             drift = self.num_computed_tokens[req_indices_gpu].to(
+@@ -1525,6 +1532,7 @@ class NPUModelRunner(GPUModelRunner):
+         return draft_token_ids
+ 
+     @torch.inference_mode()
++    @pp_opt_profile.profile_model_runner_execute
+     def execute_model(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -1568,6 +1576,7 @@ class NPUModelRunner(GPUModelRunner):
+         )):
+             scheduler_output = deepcopy(scheduler_output)
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        forward_profile_scope = "forward"
+         with record_function_or_nullcontext("prepare input"):
+             with self.synchronize_input_prep():
+                 # Update persistent batch states.
+@@ -1608,6 +1617,24 @@ class NPUModelRunner(GPUModelRunner):
+                 req_ids = self.input_batch.req_ids
+                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
++                pp_opt_profile.set_microbatch_stats(
++                    self.input_batch, num_scheduled_tokens_np
++                )
++                if os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0") == "1":
++                    computed_tokens = self.input_batch.num_computed_tokens_cpu[
++                        :num_reqs
++                    ].astype(np.int64, copy=False)
++                    aggregated_ctx_len = int(
++                        np.sum(computed_tokens + num_scheduled_tokens_np)
++                    )
++                    forward_profile_scope = (
++                        "pp_forward"
++                        f"|pp={get_pp_group().rank_in_group}"
++                        f"|mb={getattr(scheduler_output, 'microbatch_id', -1)}"
++                        f"|reqs={num_reqs}"
++                        f"|ctx={aggregated_ctx_len}"
++                        f"|tokens={int(np.sum(num_scheduled_tokens_np))}"
++                    )
+                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+ 
+                 (
+@@ -1783,7 +1810,7 @@ class NPUModelRunner(GPUModelRunner):
+         # Run forward pass
+         clear_kv_metadata = self.speculative_config is None
+         with (
+-            record_function_or_nullcontext("forward"),
++            record_function_or_nullcontext(forward_profile_scope),
+             set_ascend_forward_context(
+                 attn_metadata,
+                 self.vllm_config,
+@@ -1803,9 +1830,20 @@ class NPUModelRunner(GPUModelRunner):
+                 ),
+             ) as kv_connector_output,
+         ):
+-            hidden_states = self._model_forward(
+-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+-            )
++            pp_opt_profile.mark_t2()
++            try:
++                hidden_states = self._model_forward(
++                    num_tokens_padded,
++                    input_ids,
++                    positions,
++                    intermediate_tensors,
++                    inputs_embeds,
++                    **model_kwargs,
++                )
++            finally:
++                if pp_opt_profile.record_active():
++                    torch.npu.synchronize()
++                pp_opt_profile.mark_t3()
+         with record_function_or_nullcontext("post process"):
+             aux_hidden_states = None
+             if self.use_aux_hidden_state_outputs:
+@@ -2487,7 +2525,6 @@ class NPUModelRunner(GPUModelRunner):
+         else:
+             max_seq_len = self.seq_lens[:num_reqs].max().item()
+ 
+-
+         kv_cache_groups = self.kv_cache_config.kv_cache_groups
+ 
+         def _get_pcp_metadata(block_table_tensor):
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index b5a94273f1..66ae7ce774 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -26,6 +26,7 @@ import re
+ import subprocess
+ import sys
+ from types import NoneType
++from typing import Any
+ 
+ import torch
+ import torch.nn as nn
+@@ -48,6 +49,7 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
++from vllm.v1.worker import pp_opt_profile
+ from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+ from vllm.v1.worker.worker_base import (
+     CompilationTimes,  # noqa: E402
+@@ -358,6 +360,7 @@ class NPUWorker(WorkerBase):
+ 
+         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
+         self._pp_send_work: list[Handle] = []
++        self._pp_send_buffer_refs: list[tuple[list[Handle], dict[str, Any]]] = []
+ 
+         ascend_compilation_config = get_ascend_config().ascend_compilation_config
+         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
+@@ -632,6 +635,7 @@ class NPUWorker(WorkerBase):
+ 
+         return int(self.available_kv_cache_memory_bytes)
+ 
++    @pp_opt_profile.profile_worker_execute
+     def execute_model(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -640,10 +644,27 @@ class NPUWorker(WorkerBase):
+         if envs_ascend.MSMONITOR_USE_DAEMON:
+             dp.step()
+ 
+-        if self._pp_send_work:
++        if envs_vllm.VLLM_PP_OPT_OVERLAP_SENDS and self._pp_send_buffer_refs:
++            active_send_refs: list[tuple[list[Handle], dict[str, Any]]] = []
++            for handles, tensor_dict in self._pp_send_buffer_refs:
++                if handles and all(handle.is_completed() for handle in handles):
++                    continue
++                active_send_refs.append((handles, tensor_dict))
++            self._pp_send_buffer_refs = active_send_refs
++            max_retained_sends = max(
++                8, self.parallel_config.pipeline_parallel_size * 2
++            )
++            while len(self._pp_send_buffer_refs) >= max_retained_sends:
++                handles, _ = self._pp_send_buffer_refs.pop(0)
++                for handle in handles:
++                    handle.wait()
++
++        if self._pp_send_work and not envs_vllm.VLLM_USE_PP_OPT_SCHEDULER:
+             for handle in self._pp_send_work:
+                 handle.wait()
+             self._pp_send_work = []
++        elif self._pp_send_work:
++            self._pp_send_work = []
+ 
+         intermediate_tensors = None
+         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+@@ -677,10 +698,27 @@ class NPUWorker(WorkerBase):
+             all_gather_group = None
+         else:
+             all_gather_group = get_tp_group()
+-        self._pp_send_work = get_pp_group().isend_tensor_dict(
+-            output.tensors,
++        send_tensors = output.tensors
++        if (
++            envs_vllm.VLLM_USE_PP_OPT_SCHEDULER
++            and envs_vllm.VLLM_PP_OPT_OVERLAP_SENDS
++        ):
++            send_tensors = {
++                key: value.clone() if isinstance(value, torch.Tensor) else value
++                for key, value in output.tensors.items()
++            }
++        pp_send_work = get_pp_group().isend_tensor_dict(
++            send_tensors,
+             all_gather_group=all_gather_group,
+         )
++        if (
++            envs_vllm.VLLM_USE_PP_OPT_SCHEDULER
++            and envs_vllm.VLLM_PP_OPT_OVERLAP_SENDS
++            and pp_send_work
++        ):
++            self._pp_send_buffer_refs.append((pp_send_work, send_tensors))
++        elif not envs_vllm.VLLM_USE_PP_OPT_SCHEDULER:
++            self._pp_send_work = pp_send_work
+ 
+         kv_connector_output = output.kv_connector_output
+         if not kv_connector_output:
+@@ -695,6 +733,7 @@ class NPUWorker(WorkerBase):
+         return output
+ 
+     @torch.inference_mode()
++    @pp_opt_profile.profile_worker_sample_tokens
+     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+         return self.model_runner.sample_tokens(grammar_output)
+ 
+-- 
+2.53.0.windows.3
+

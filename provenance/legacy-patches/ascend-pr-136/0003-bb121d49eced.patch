@@ -1,0 +1,29 @@
+From bb121d49eceda46f45f3c8060de3e3b5580ea5b7 Mon Sep 17 00:00:00 2001
+From: Chenxi XU <xcx14@outlook.com>
+Date: Sat, 18 Jul 2026 11:27:08 +0800
+Subject: [PATCH] Document smoothed throughput figures
+
+---
+ .../developer_guide/Design_Documents/pp_optimization.md     | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/docs/source/developer_guide/Design_Documents/pp_optimization.md b/docs/source/developer_guide/Design_Documents/pp_optimization.md
+index c2e629f417..7183a4e454 100644
+--- a/docs/source/developer_guide/Design_Documents/pp_optimization.md
++++ b/docs/source/developer_guide/Design_Documents/pp_optimization.md
+@@ -63,8 +63,10 @@ completed 1,000/1,000 requests, and generated the same 349,357 output tokens.
+ 
+ The full pair was launched only after a 200-request regression gate passed at
+ 1.201x. Detailed methodology, latency measurements, and machine-readable
+-results are in `vllm-hust/benchmarks/pp_opt/results.md` and its adjacent
+-`results/end_to_end` directory.
++results are in `vllm-hust/benchmarks/pp_opt/results.md`. The adjacent
++`results/end_to_end` directory contains unsmoothed one-second throughput
++series and centered 30-second moving-average figures for both validated Qwen3
++models.
+ 
+ ## Editable setup
+ 
+-- 
+2.53.0.windows.3
+
