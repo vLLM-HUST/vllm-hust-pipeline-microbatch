@@ -2,7 +2,7 @@
 
 Owner-led research carrier for calibrated pipeline-parallel microbatch scheduling. The work crosses scheduler, executor, communication, KV, worker, and benchmark boundaries and requires neutral host contracts.
 
-**Status: source-preservation and contract-design scaffold. There is no installable runtime implementation or support claim yet.**
+**Status: rank-local cost prediction and deterministic microbatch assignment are installable and tested; vLLM scheduler/worker attachment remains blocked until `HOST_CONTRACT.md` is implemented.**
 
 Technical ownership belongs to @xsun2001. Source extraction must preserve exact authorship, license, tests, constraints, and evidence before activation is considered.
 

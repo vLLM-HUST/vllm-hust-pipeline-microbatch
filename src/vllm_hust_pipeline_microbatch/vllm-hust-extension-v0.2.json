@@ -15,13 +15,26 @@
   },
   "lifecycle_owner": "vllm",
   "protocols": [
-    {"name": "vllm.pipeline.microbatch.proposed", "version_range": null}
+    {"name": "vllm.pipeline.batch-queue", "version_range": ">=1,<2"},
+    {"name": "vllm.scheduler.request-work", "version_range": ">=1,<2"},
+    {"name": "vllm.pipeline.in-flight", "version_range": ">=1,<2"},
+    {"name": "vllm.pipeline.profile", "version_range": ">=1,<2"}
+  ],
+  "components": [
+    {
+      "component_id": "pipeline-microbatch-planner",
+      "implementation_ref": "vllm_hust_pipeline_microbatch.planner:assign_lowest_cost",
+      "contracts": ["vllm.pipeline.batch-queue.v1", "vllm.scheduler.request-work.v1", "vllm.pipeline.in-flight.v1"],
+      "execution_planes": ["scheduler", "worker"],
+      "isolation": "trusted_in_process",
+      "permissions": []
+    }
   ],
   "implementation": [
     {
       "type": "python_module",
-      "module": "vllm_hust_pipeline_microbatch",
-      "object": "VllmHustPipelineMicrobatchContractProposal",
+      "module": "vllm_hust_pipeline_microbatch.planner",
+      "object": "assign_lowest_cost",
       "status": "import_only"
     }
   ],
