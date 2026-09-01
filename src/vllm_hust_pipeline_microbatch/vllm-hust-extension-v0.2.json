@@ -1,0 +1,47 @@
+{
+  "schema_version": "0.2-experimental",
+  "extension_id": "org.vllm-hust.pipeline-microbatch",
+  "extension_version": "0.1.0.dev0",
+  "kind": "in_process_plugin",
+  "host": {
+    "provider": "vllm",
+    "name": "vllm",
+    "version_range": ">=0"
+  },
+  "runtime": {
+    "type": "python",
+    "process_scope": "vllm-processes",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [
+    {"name": "vllm.pipeline.batch-queue", "version_range": ">=1,<2"},
+    {"name": "vllm.scheduler.request-work", "version_range": ">=1,<2"},
+    {"name": "vllm.pipeline.in-flight", "version_range": ">=1,<2"},
+    {"name": "vllm.pipeline.profile", "version_range": ">=1,<2"}
+  ],
+  "components": [
+    {
+      "component_id": "pipeline-microbatch-planner",
+      "implementation_ref": "vllm_hust_pipeline_microbatch.planner:assign_lowest_cost",
+      "contracts": ["vllm.pipeline.batch-queue.v1", "vllm.scheduler.request-work.v1", "vllm.pipeline.in-flight.v1"],
+      "execution_planes": ["scheduler", "worker"],
+      "isolation": "trusted_in_process",
+      "permissions": []
+    }
+  ],
+  "implementation": [
+    {
+      "type": "python_module",
+      "module": "vllm_hust_pipeline_microbatch.planner",
+      "object": "assign_lowest_cost",
+      "status": "import_only"
+    }
+  ],
+  "requires_services": [],
+  "activation": {
+    "entry_points": [],
+    "environment": {},
+    "additional_config": {}
+  }
+}
