@@ -37,7 +37,6 @@ def _vllm_config(
             "microbatch_count": 2,
         }
     return SimpleNamespace(
-        additional_config={"pipeline_microbatch": profile},
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=pp, tensor_parallel_size=tp
         ),
@@ -46,19 +45,31 @@ def _vllm_config(
     )
 
 
+def _profile() -> dict:
+    return {
+        "mode": "balanced",
+        "model_ids": ["Qwen/Qwen3.8-27B"],
+        "pipeline_parallel_size": 2,
+        "tensor_parallel_size": 2,
+        "microbatch_count": 2,
+    }
+
+
 def test_configuration_rejects_tp4_and_profile_mismatch() -> None:
     with pytest.raises(ValueError, match="pipeline_parallel_size > 1"):
-        PipelineMicrobatchConfig.from_vllm_config(_vllm_config(pp=1, tp=4))
+        PipelineMicrobatchConfig.from_config(_profile(), _vllm_config(pp=1, tp=4))
 
     with pytest.raises(ValueError, match="topology mismatch"):
-        PipelineMicrobatchConfig.from_vllm_config(_vllm_config(pp=2, tp=1))
+        PipelineMicrobatchConfig.from_config(_profile(), _vllm_config(pp=2, tp=1))
 
     with pytest.raises(ValueError, match="does not cover model"):
-        PipelineMicrobatchConfig.from_vllm_config(_vllm_config(model="other/model"))
+        PipelineMicrobatchConfig.from_config(
+            _profile(), _vllm_config(model="other/model")
+        )
 
 
 def test_balanced_policy_assigns_and_rotates_batches() -> None:
-    policy = PipelineMicrobatchPolicy.from_vllm_config(_vllm_config())
+    policy = PipelineMicrobatchPolicy.from_config(_profile(), _vllm_config())
     requests = (
         FakeRequest("r0", 10),
         FakeRequest("r1", 20),
@@ -77,7 +88,7 @@ def test_balanced_policy_assigns_and_rotates_batches() -> None:
 
 
 def test_policy_reclaims_cancelled_requests_and_recovers() -> None:
-    policy = PipelineMicrobatchPolicy.from_vllm_config(_vllm_config())
+    policy = PipelineMicrobatchPolicy.from_config(_profile(), _vllm_config())
     requests = (FakeRequest("r0", 10), FakeRequest("r1", 20))
     first = policy.admit_batch(FakeContext(requests, frozenset()))
     assert first is not None
@@ -113,4 +124,4 @@ def test_calibrated_mode_requires_every_pipeline_rank() -> None:
         ],
     }
     with pytest.raises(ValueError, match="every PP rank"):
-        PipelineMicrobatchConfig.from_vllm_config(_vllm_config(profile=profile))
+        PipelineMicrobatchConfig.from_config(profile, _vllm_config(profile=profile))

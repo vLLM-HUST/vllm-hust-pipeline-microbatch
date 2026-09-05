@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -43,17 +44,9 @@ class PipelineMicrobatchConfig:
     cost_models: tuple[MicroBatchCostModel, ...] = ()
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: VllmConfig) -> PipelineMicrobatchConfig:
-        additional = vllm_config.additional_config
-        if not isinstance(additional, dict):
-            raise TypeError("additional_config must be a mapping")
-        raw = additional.get("pipeline_microbatch")
-        if not isinstance(raw, dict):
-            raise ValueError(
-                "additional_config.pipeline_microbatch is required when the "
-                "pipeline microbatch policy is configured"
-            )
-
+    def from_config(
+        cls, raw: Mapping[str, Any], vllm_config: VllmConfig
+    ) -> PipelineMicrobatchConfig:
         parallel = vllm_config.parallel_config
         pp_size = parallel.pipeline_parallel_size
         tp_size = parallel.tensor_parallel_size
@@ -151,8 +144,10 @@ class PipelineMicrobatchPolicy:
         )
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: VllmConfig) -> PipelineMicrobatchPolicy:
-        return cls(PipelineMicrobatchConfig.from_vllm_config(vllm_config))
+    def from_config(
+        cls, config: Mapping[str, Any], vllm_config: VllmConfig
+    ) -> PipelineMicrobatchPolicy:
+        return cls(PipelineMicrobatchConfig.from_config(config, vllm_config))
 
     def admit_batch(self, context: BatchAdmissionContext) -> AdmissionDecision | None:
         self.stats.calls += 1
