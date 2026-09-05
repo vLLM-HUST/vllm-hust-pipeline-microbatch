@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "id": "pipeline-microbatch",
+  "repository": "vllm-hust-pipeline-microbatch",
+  "source_subdir": "src",
+  "entrypoint": {
+    "group": "vllm_hust.extension_bundles",
+    "name": "org.vllm-hust.pipeline-microbatch"
+  },
+  "parameters": {
+    "policy_config": {
+      "flag": "--batch-admission-policy-config",
+      "required": true
+    }
+  },
+  "activation": {
+    "vllm_plugins": ["ascend"],
+    "extra_args": [
+      "--batch-admission-policy",
+      "vllm_hust_pipeline_microbatch.policy.PipelineMicrobatchPolicy",
+      "--batch-admission-policy-config",
+      "${policy_config}"
+    ]
+  },
+  "compatibility": {
+    "model_qualifications": [
+      {
+        "model": "Qwen3.8-27B",
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "execution_mode": "graph",
+        "status": "not_applicable",
+        "reason": "Dense model serving is supported, but PP=1 has no pipeline microbatch scheduling surface."
+      },
+      {
+        "model": "Qwen3.8-27B",
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 2,
+        "execution_mode": "graph",
+        "status": "not_compatible",
+        "functional_compatibility": "passed",
+        "effectiveness_qualification": {
+          "status": "failed",
+          "reason": "Balanced mode regressed matched C4/C8 throughput and fixed-work mixed C8 throughput/P95; fresh rank-local calibration is required."
+        },
+        "runtime_state_source": "live_instance_observation_only",
+        "tested_core_commit": "3e57b2f75c",
+        "tested_ascend_commit": "1cf88e9e6",
+        "evidence": "docs/evidence/sage-mate-20260905-qwen38-pp2tp2-graph.md"
+      },
+      {
+        "model": "Qwen3-32B",
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 4,
+        "status": "unverified_current_baseline",
+        "reason": "Legacy eight-card evidence is retained as provenance only."
+      },
+      {
+        "model": "Qwen3-235B-A22B",
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 4,
+        "status": "unverified_current_baseline",
+        "reason": "Legacy eight-card evidence is retained as provenance only."
+      }
+    ]
+  }
+}

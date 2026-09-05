@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vllm-hust-pipeline-microbatch"
-version = "0.1.0.dev0"
-description = "vllm-hust-pipeline-microbatch inert vLLM-HUST contract descriptor"
+version = "0.2.0"
+description = "Calibrated pipeline-microbatch admission policy for vLLM-HUST"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
