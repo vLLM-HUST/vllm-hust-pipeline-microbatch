@@ -1,16 +1,19 @@
-# Pipeline microbatch host contract proposal
+# Pipeline microbatch host contract
 
 The extracted rank-local cost model and assignment functions are host-independent.
-Runtime activation requires:
+Runtime activation uses `vllm.batch-admission-policy` API 1.1:
 
-1. `vllm.pipeline.batch-queue.v1`: explicit ownership of a bounded microbatch
-   queue without adding fields directly to core scheduler output classes;
-2. `vllm.scheduler.request-work.v1`: immutable request/context snapshots;
-3. `vllm.pipeline.in-flight.v1`: rank-safe in-flight IDs and completion receipts;
-4. `vllm.pipeline.profile.v1`: default-off timestamps with rank-specific output
-   paths and an evidence label.
+1. Core owns the bounded future queue and opaque in-flight batch receipts.
+2. Scheduler exposes immutable request-work snapshots; the policy returns only
+   a batch ID and eligible request IDs.
+3. Scheduler retains Request, RequestQueue, KV cache and SchedulerOutput
+   ownership and validates every policy result.
+4. Completion and abort receipts close policy lifecycle state; exceptions or
+   invalid results disable the policy and restore built-in scheduling.
+5. Requestless connector/finished-request maintenance bypasses policy admission
+   and continues through the built-in empty step.
 
-The provider must reject asynchronous scheduling and unsupported connectors or
-parallel modes. Synthetic cost models may be used only for smoke tests and must
-never be reported as measured performance. Historical CSV/PNG artifacts remain
-provenance evidence, not current compatibility receipts.
+The policy rejects PP1, topology/model mismatches, and incomplete calibrated
+profiles. Synthetic or balanced profiles may be used for smoke tests only and
+must never be reported as measured performance. Historical CSV/PNG artifacts
+remain provenance evidence, not current compatibility receipts.
