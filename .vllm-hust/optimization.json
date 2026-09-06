@@ -37,16 +37,18 @@
         "tensor_parallel_size": 2,
         "pipeline_parallel_size": 2,
         "execution_mode": "graph",
-        "status": "not_compatible",
+        "status": "compatible",
         "functional_compatibility": "passed",
+        "recovery_qualification": "passed",
         "effectiveness_qualification": {
-          "status": "failed",
-          "reason": "Balanced mode regressed matched C4/C8 throughput and fixed-work mixed C8 throughput/P95; fresh rank-local calibration is required."
+          "status": "not_recommended_for_tested_cell",
+          "reason": "Balanced mode is correct and recoverable but regressed matched C4/C8 throughput and fixed-work mixed C8 throughput/P95; this scoped performance result does not revoke functional availability. Fresh rank-local calibration is required before recommending this cell."
         },
         "runtime_state_source": "live_instance_observation_only",
         "tested_core_commit": "3e57b2f75c",
         "tested_ascend_commit": "1cf88e9e6",
-        "evidence": "docs/evidence/sage-mate-20260905-qwen38-pp2tp2-graph.md"
+        "evidence": "docs/evidence/sage-mate-20260905-qwen38-pp2tp2-graph.md",
+        "recommendation": "not_recommended_for_tested_cell"
       },
       {
         "model": "Qwen3-32B",

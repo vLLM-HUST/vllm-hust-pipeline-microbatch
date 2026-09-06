@@ -44,10 +44,12 @@
       "_manager_runtime_qualification": {
         "accelerator": "ascend",
         "execution_mode": "graph",
-        "pipeline_parallel_size": 4,
+        "pipeline_parallel_size": 2,
         "tensor_parallel_size": 2,
         "calibration_status": "measured",
-        "performance_status": "passed"
+        "functional_status": "passed",
+        "recovery_status": "passed",
+        "performance_status": "not-recommended-for-tested-cell"
       }
     }
   }

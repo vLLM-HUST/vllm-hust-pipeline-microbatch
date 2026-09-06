@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from vllm_hust_ext.manifest import activation_blocker, load_manifest
@@ -17,3 +18,20 @@ def test_policy_manifest_declares_current_gated_host_contract() -> None:
     assert manifest.host.version_range == ">=0.28.1rc1.dev319,<0.29"
     assert manifest.protocols[0].name == "vllm.batch-admission-policy"
     assert manifest.components[0].contracts == ("vllm.batch-admission-policy.v1",)
+
+    payload = json.loads(
+        Path(vllm_hust_pipeline_microbatch.__file__)
+        .with_name("vllm-hust-extension-v0.2.json")
+        .read_text(encoding="utf-8")
+    )
+    qualification = payload["activation"]["additional_config"][
+        "_manager_runtime_qualification"
+    ]
+    assert qualification["pipeline_parallel_size"] == 2
+    assert qualification["tensor_parallel_size"] == 2
+    assert qualification["functional_status"] == "passed"
+    assert qualification["recovery_status"] == "passed"
+    assert (
+        qualification["performance_status"]
+        == "not-recommended-for-tested-cell"
+    )

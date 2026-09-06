@@ -42,9 +42,11 @@ Both arms use the same final image; the only difference is policy activation.
 
 ## Decision and rollback
 
-Qwen3.8-27B PP2+TP2 is functionally verified but fails the effectiveness gate;
-it is not compatible for release. The balanced profile improves mixed P50 by
-segregating work but creates severe long-request tail imbalance. Historical
+Qwen3.8-27B PP2+TP2 is functionally verified, recoverable, compatible, and
+available. Its balanced profile is **not recommended for this tested cell**:
+it improves mixed P50 by segregating work but creates severe long-request tail
+imbalance. This scoped negative performance result does not revoke functional
+availability. Historical
 PP4+TP2 coefficients are invalid for this model and topology. Requalification
 requires fresh rank-local coefficients and the full matrix above.
 
