@@ -1,0 +1,44 @@
+{
+  "canonical_repository": "https://github.com/vLLM-HUST/vllm-hust-pipeline-microbatch",
+  "display_name": "Pipeline Microbatch",
+  "evidence": {
+    "index": "https://github.com/vLLM-HUST/vllm-hust-website/blob/main/docs/FRONTIER-QWEN35-PIPELINE-K8S.md",
+    "latest_result": "https://github.com/vLLM-HUST/vllm-hust-website/blob/main/docs/FRONTIER-QWEN35-PIPELINE-K8S.md",
+    "performance_claims": [],
+    "qualification": "unqualified"
+  },
+  "lifecycle": {
+    "activation_contract": "See the extension manifest and README; discovery alone does not enable this MOD.",
+    "default_enabled": false,
+    "rollback_contract": "Disable the MOD and return to the unmodified host path.",
+    "status": "incubating"
+  },
+  "metadata_source": {
+    "commit": "7df1647048ac5f05fcc502ce4bea94f26d0f5362",
+    "repository": "vLLM-HUST/vllm-hust-website"
+  },
+  "mod_id": "pipeline-microbatch-migration",
+  "repository": "vllm-hust-pipeline-microbatch",
+  "responsibility": {
+    "advisor_status": "declared",
+    "advisors": [
+      {
+        "name": "Chen Xinyu",
+        "relationship": "external_contributor"
+      }
+    ],
+    "maintainers": [
+      {
+        "github": "xsun2001",
+        "name": "徐晨曦"
+      }
+    ],
+    "organization": "vLLM-HUST"
+  },
+  "schema_version": "vllm-hust-mod-metadata-v1",
+  "scope": {
+    "mechanism": "pipeline_scheduling_policy",
+    "out_of_scope": [],
+    "supported_workloads": []
+  }
+}
