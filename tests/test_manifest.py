@@ -14,8 +14,8 @@ def test_policy_manifest_declares_current_gated_host_contract() -> None:
     )
     assert manifest.bundle_id == "org.vllm-hust.pipeline-microbatch"
     assert activation_blocker(manifest) is None
-    assert manifest.bundle_version == "0.2.0"
-    assert manifest.host.version_range == ">=0.28.1rc1.dev319,<0.29"
+    assert manifest.bundle_version == "0.2.1.dev1"
+    assert manifest.host.version_range == ">=0.31.1.post1.dev19,<0.31.1.post1.dev20"
     assert manifest.protocols[0].name == "vllm.batch-admission-policy"
     assert manifest.components[0].contracts == ("vllm.batch-admission-policy.v1",)
 
@@ -28,10 +28,9 @@ def test_policy_manifest_declares_current_gated_host_contract() -> None:
         "_manager_runtime_qualification"
     ]
     assert qualification["pipeline_parallel_size"] == 2
-    assert qualification["tensor_parallel_size"] == 2
-    assert qualification["functional_status"] == "passed"
-    assert qualification["recovery_status"] == "passed"
-    assert (
-        qualification["performance_status"]
-        == "not-recommended-for-tested-cell"
-    )
+    assert qualification["tensor_parallel_size"] == 1
+    assert qualification["host_commit"] == "f7bc2a5eebc505f28abfbf318734225e4c30c64c"
+    assert "functional_status" not in qualification
+    assert "recovery_status" not in qualification
+    assert "status" not in qualification
+    assert manifest.host.api_range == "==1.0"
